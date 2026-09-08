@@ -48,6 +48,7 @@ public class PaymentService {
 
     // 手续费率
     private static final BigDecimal FEE_RATE = new BigDecimal("0.001"); // 0.1%
+    private static final String REQUIRED_PAYMENT_CREDENTIAL = "KYCCredential";
 
     // 乐观锁重试次数
     private static final int MAX_RETRY = 3;
@@ -261,9 +262,9 @@ public class PaymentService {
         List<String> reasons = new ArrayList<>();
         int score = 0;
         boolean payerKyc = kycService.isDIDKYCVerified(payerDid)
-            && vcService.hasValidCredential(payerDid, "KYCCredential");
+            && vcService.hasValidCredential(payerDid, REQUIRED_PAYMENT_CREDENTIAL);
         boolean payeeKyc = kycService.isDIDKYCVerified(request.getPayeeDid())
-            && vcService.hasValidCredential(request.getPayeeDid(), "KYCCredential");
+            && vcService.hasValidCredential(request.getPayeeDid(), REQUIRED_PAYMENT_CREDENTIAL);
 
         if (!payerKyc) {
             score = 100;
@@ -340,13 +341,17 @@ public class PaymentService {
             throw new BusinessException("订单已过期");
         }
 
-        // 3. 以条件更新抢占订单，避免两个并发请求重复扣款
+        // 3. 创建订单之后，DID、KYC 或凭证都可能被吊销或过期。
+        // 在领取订单和扣款之间重新执行支付门控，避免旧订单绕过当前身份状态。
+        verifyExecutionEligibility(order);
+
+        // 4. 以条件更新抢占订单，避免两个并发请求重复扣款
         if (orderMapper.markProcessing(orderNo) != 1) {
             throw new BusinessException("订单正在处理或已被处理");
         }
 
         try {
-            // 4. 执行转账 - 使用乐观锁
+            // 5. 执行转账 - 使用乐观锁
             Wallet payerWallet = walletMapper.selectById(order.getPayerWalletId());
             if (payerWallet == null) {
                 throw new BusinessException("付款人钱包不存在");
@@ -373,7 +378,7 @@ public class PaymentService {
                 throw new BusinessException("支付执行失败，请联系客服");
             }
 
-            // 5. 创建交易记录
+            // 6. 创建交易记录
             String txHash = "tx_" + UUID.randomUUID().toString().replace("-", "");
             Transaction transaction = Transaction.builder()
                 .orderNo(orderNo)
@@ -392,7 +397,7 @@ public class PaymentService {
 
             transactionMapper.insert(transaction);
 
-            // 6. 更新订单状态
+            // 7. 更新订单状态
             if (orderMapper.markPaid(orderNo, Instant.now()) != 1) {
                 throw new BusinessException("订单状态更新失败，转账已回滚");
             }
@@ -408,6 +413,24 @@ public class PaymentService {
             log.error("Payment execution failed unexpectedly", e);
             orderMapper.updateStatus(orderNo, 3);
             throw new BusinessException("支付执行失败: " + e.getMessage());
+        }
+    }
+
+    /**
+     * 执行时验证会影响资金释放的实时身份门控。
+     * 收款方 KYC 仍作为创建订单时的可解释风险因子，不把它升级为新的硬性准入条件；
+     * 付款方则必须始终具备有效 DID、人工审核结论和可复验凭证。
+     */
+    private void verifyExecutionEligibility(PaymentOrder order) {
+        if (!didService.isValidDID(order.getPayerDid())) {
+            throw new BusinessException("付款人DID无效或已吊销，请重新创建订单");
+        }
+        if (!didService.isValidDID(order.getPayeeDid())) {
+            throw new BusinessException("收款人DID无效或已吊销，请重新创建订单");
+        }
+        if (!kycService.isDIDKYCVerified(order.getPayerDid())
+            || !vcService.hasValidCredential(order.getPayerDid(), REQUIRED_PAYMENT_CREDENTIAL)) {
+            throw new BusinessException("付款人缺少当前有效的审核结论凭证，请重新完成审核后创建订单");
         }
     }
 

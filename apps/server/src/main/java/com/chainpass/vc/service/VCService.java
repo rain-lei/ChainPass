@@ -1,6 +1,7 @@
 package com.chainpass.vc.service;
 
 import com.alibaba.fastjson2.JSON;
+import com.alibaba.fastjson2.JSONObject;
 import com.chainpass.did.entity.DIDDocument;
 import com.chainpass.did.service.DIDService;
 import com.chainpass.exception.BusinessException;
@@ -159,27 +160,74 @@ public class VCService {
         }
 
         // 2. 检查是否已吊销
-        if (record.getStatus() == 2) {
+        if (Integer.valueOf(2).equals(record.getStatus())) {
             return VCDto.VerifyResult.invalid("凭证已被吊销");
+        }
+        if (record.getStatus() == null || record.getExpiresAt() == null) {
+            return VCDto.VerifyResult.invalid("凭证状态或有效期缺失");
         }
 
         // 3. 检查过期时间
-        if (record.getExpiresAt().isBefore(Instant.now())) {
+        if (!record.getExpiresAt().isAfter(Instant.now())) {
             // 自动更新状态为过期
             if (record.getStatus() == 0) {
                 vcRecordMapper.updateStatus(vcId, 1);
             }
             return VCDto.VerifyResult.invalid("凭证已过期");
         }
+        if (record.getStatus() != 0) {
+            return VCDto.VerifyResult.invalid("凭证状态无效");
+        }
 
-        // 4. 使用真实Ed25519签名验证
-        boolean signatureValid = issuerKeyService.verify(record.getCredentialHash(), record.getSignature());
+        // 4. 从实际正文重算哈希。使用 JSON 对象保留声明顺序和未知字段，
+        // 避免转成 Java 实体时丢弃被修改的字段；沿用现有本地签发格式，不是 JSON-LD 规范化。
+        String credentialHash;
+        try {
+            JSONObject body = JSON.parseObject(record.getVcData());
+            if (body == null) {
+                return VCDto.VerifyResult.invalid("凭证内容格式无效");
+            }
+            JSONObject proof = body.getJSONObject("proof");
+            body.remove("proof");
+            credentialHash = hashSHA256(JSON.toJSONString(body));
+            if (!credentialHash.equals(record.getCredentialHash())) {
+                return VCDto.VerifyResult.invalid("凭证内容校验失败：正文可能被篡改");
+            }
+
+            // 业务门控使用数据库索引字段，必须与已签名正文保持一致。
+            if (!Objects.equals(vcId, body.getString("id"))
+                || !Objects.equals(record.getVcId(), body.getString("id"))
+                || !Objects.equals(record.getHolderDid(), body.getJSONObject("credentialSubject").getString("id"))
+                || !List.of("VerifiableCredential", record.getVcType()).equals(body.getJSONArray("type"))
+                || !IssuerKeyService.ISSUER_DID.equals(body.getJSONObject("issuer").getString("id"))
+                || !IssuerKeyService.ISSUER_DID.equals(record.getIssuerDid())) {
+                return VCDto.VerifyResult.invalid("凭证记录与签名正文不一致");
+            }
+            if (proof == null
+                || !"ChainPassEd25519Signature2026".equals(proof.getString("type"))
+                || !"assertionMethod".equals(proof.getString("proofPurpose"))
+                || !issuerKeyService.getVerificationMethodId().equals(proof.getString("verificationMethod"))
+                || record.getSignature() == null
+                || !record.getSignature().equals(proof.getString("proofValue"))) {
+                return VCDto.VerifyResult.invalid("凭证证明无效或与签名记录不一致");
+            }
+            // 即使数据库中的有效期被延长，也不能超过签名正文中的有效期。
+            if (!Instant.parse(body.getString("expirationDate")).isAfter(Instant.now())) {
+                return VCDto.VerifyResult.invalid("凭证已过期");
+            }
+        } catch (RuntimeException | NoSuchAlgorithmException e) {
+            log.warn("Invalid VC content for: {}", vcId);
+            return VCDto.VerifyResult.invalid("凭证内容格式无效");
+        }
+
+        // 5. 使用重算的正文哈希验证真实 Ed25519 签名。
+        boolean signatureValid = issuerKeyService.verify(credentialHash, record.getSignature());
         if (!signatureValid) {
             log.warn("VC signature verification failed for: {}", vcId);
             return VCDto.VerifyResult.invalid("签名验证失败：凭证可能被篡改");
         }
 
-        // 5. 验证持有者DID是否有效
+        // 6. 验证持有者DID是否有效
         if (!didService.isValidDID(record.getHolderDid())) {
             return VCDto.VerifyResult.invalid("持有者DID无效或已吊销");
         }

@@ -2,8 +2,10 @@ package com.chainpass.payment.service;
 
 import com.chainpass.did.entity.DIDDocument;
 import com.chainpass.did.service.DIDService;
+import com.chainpass.exception.BusinessException;
 import com.chainpass.payment.dto.PaymentDto;
 import com.chainpass.payment.entity.PaymentOrder;
+import com.chainpass.payment.entity.Transaction;
 import com.chainpass.payment.entity.Wallet;
 import com.chainpass.payment.mapper.*;
 import com.chainpass.compliance.kyc.KYCService;
@@ -23,6 +25,7 @@ import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.*;
 
 /**
@@ -181,6 +184,71 @@ class PaymentServiceTest {
     }
 
     @Test
+    @DisplayName("执行支付 - 付款人DID吊销后不再扣款")
+    void testExecutePayment_RejectsRevokedPayerDidBeforeClaimingOrder() {
+        PaymentOrder order = executableOrder();
+        when(orderMapper.findByOrderNo(order.getOrderNo())).thenReturn(order);
+        when(didService.isValidDID(payerDid)).thenReturn(false);
+
+        BusinessException exception = assertThrows(BusinessException.class,
+            () -> paymentService.executePayment(order.getOrderNo(), payerDid));
+
+        assertEquals("付款人DID无效或已吊销，请重新创建订单", exception.getMessage());
+        verify(orderMapper, never()).markProcessing(any());
+        verify(walletMapper, never()).addCnyBalanceWithVersion(any(), any(), any());
+        verify(transactionMapper, never()).insert(any(Transaction.class));
+    }
+
+    @Test
+    @DisplayName("执行支付 - 凭证失效后不再扣款")
+    void testExecutePayment_RejectsInvalidPayerCredentialBeforeClaimingOrder() {
+        PaymentOrder order = executableOrder();
+        when(orderMapper.findByOrderNo(order.getOrderNo())).thenReturn(order);
+        when(didService.isValidDID(payerDid)).thenReturn(true);
+        when(didService.isValidDID(payeeDid)).thenReturn(true);
+        when(kycService.isDIDKYCVerified(payerDid)).thenReturn(true);
+        when(vcService.hasValidCredential(payerDid, "KYCCredential")).thenReturn(false);
+
+        BusinessException exception = assertThrows(BusinessException.class,
+            () -> paymentService.executePayment(order.getOrderNo(), payerDid));
+
+        assertEquals("付款人缺少当前有效的审核结论凭证，请重新完成审核后创建订单", exception.getMessage());
+        verify(orderMapper, never()).markProcessing(any());
+        verify(walletMapper, never()).addCnyBalanceWithVersion(any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("执行支付 - 扣款前重新验证当前身份状态")
+    void testExecutePayment_RevalidatesEligibilityBeforeLedgerMutation() {
+        PaymentOrder order = executableOrder();
+        when(orderMapper.findByOrderNo(order.getOrderNo())).thenReturn(order);
+        when(didService.isValidDID(payerDid)).thenReturn(true);
+        when(didService.isValidDID(payeeDid)).thenReturn(true);
+        when(kycService.isDIDKYCVerified(payerDid)).thenReturn(true);
+        when(vcService.hasValidCredential(payerDid, "KYCCredential")).thenReturn(true);
+        when(orderMapper.markProcessing(order.getOrderNo())).thenReturn(1);
+        when(walletMapper.selectById(1L)).thenReturn(payerWallet);
+        when(walletMapper.selectById(2L)).thenReturn(payeeWallet);
+        when(walletMapper.addCnyBalanceWithVersion(eq(1L), eq(new BigDecimal("-100.10")), any()))
+            .thenReturn(1);
+        when(walletMapper.addCnyBalanceWithVersion(eq(2L), eq(new BigDecimal("100.00")), any()))
+            .thenReturn(1);
+        when(transactionMapper.insert(any(Transaction.class))).thenReturn(1);
+        when(orderMapper.markPaid(eq(order.getOrderNo()), any(Instant.class))).thenReturn(1);
+
+        Transaction transaction = paymentService.executePayment(order.getOrderNo(), payerDid);
+
+        assertNotNull(transaction);
+        verify(didService).isValidDID(payerDid);
+        verify(didService).isValidDID(payeeDid);
+        verify(kycService).isDIDKYCVerified(payerDid);
+        verify(vcService).hasValidCredential(payerDid, "KYCCredential");
+        verify(orderMapper).markProcessing(order.getOrderNo());
+        verify(walletMapper).addCnyBalanceWithVersion(eq(1L), eq(new BigDecimal("-100.10")), any());
+        verify(walletMapper).addCnyBalanceWithVersion(eq(2L), eq(new BigDecimal("100.00")), any());
+    }
+
+    @Test
     @DisplayName("获取汇率 - 成功")
     void testGetExchangeRate_Success() {
         // Given
@@ -222,5 +290,24 @@ class PaymentServiceTest {
 
         assertEquals(BigDecimal.ZERO, wallet.getBalanceCny());
         verify(walletMapper, never()).addCnyBalance(any(), any());
+    }
+
+    private PaymentOrder executableOrder() {
+        payerWallet.setVersion(0);
+        payeeWallet.setVersion(0);
+        return PaymentOrder.builder()
+            .orderNo("PAY-executable")
+            .payerDid(payerDid)
+            .payeeDid(payeeDid)
+            .payerWalletId(payerWallet.getId())
+            .payeeWalletId(payeeWallet.getId())
+            .amount(new BigDecimal("100.00"))
+            .currency("CNY")
+            .originalAmount(new BigDecimal("100.00"))
+            .originalCurrency("CNY")
+            .feeAmount(new BigDecimal("0.10"))
+            .status(0)
+            .expiredAt(Instant.now().plusSeconds(300))
+            .build();
     }
 }
